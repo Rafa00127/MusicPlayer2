@@ -16,6 +16,142 @@ CBassMixLibrary CBassCore::m_bass_mix_lib;
 CBassFxLibrary CBassCore::m_bass_fx_lib;
 bool CBassCore::m_fading = false;
 
+// ---- AVS3-P3 (av3a) decoder DLL -------------------------------------------
+typedef int (__cdecl* AV3A_PROBE_FN)(const wchar_t*);
+typedef int (__cdecl* AV3A_DECODE_FN)(const wchar_t*, void**, unsigned*);
+typedef void (__cdecl* AV3A_FREE_FN)(void*);
+typedef void* (__cdecl* AV3A_OPEN_FN)(const wchar_t*);
+typedef unsigned long long (__cdecl* AV3A_LEN_FN)(void*);
+typedef int (__cdecl* AV3A_READ_FN)(void*, void*, unsigned, unsigned long long);
+typedef void (__cdecl* AV3A_CLOSE_FN)(void*);
+
+static AV3A_PROBE_FN g_av3a_probe{};
+static AV3A_DECODE_FN g_av3a_decode{};
+static AV3A_FREE_FN g_av3a_free{};
+static AV3A_OPEN_FN g_av3a_open{};
+static AV3A_LEN_FN g_av3a_len{};
+static AV3A_READ_FN g_av3a_read{};
+static AV3A_CLOSE_FN g_av3a_close{};
+
+void CBassCore::InitAv3aDll()
+{
+    if (m_av3a_dll != nullptr)
+        return;
+    wstring dll_path = theApp.m_module_dir + L"av3a_dec.dll";
+    HMODULE h = LoadLibraryW(dll_path.c_str());
+    if (h == nullptr)
+        return;
+    g_av3a_probe = (AV3A_PROBE_FN)GetProcAddress(h, "av3a_probe");
+    g_av3a_decode = (AV3A_DECODE_FN)GetProcAddress(h, "av3a_decode_wav");
+    g_av3a_free = (AV3A_FREE_FN)GetProcAddress(h, "av3a_free");
+    g_av3a_open = (AV3A_OPEN_FN)GetProcAddress(h, "av3a_stream_open");
+    g_av3a_len = (AV3A_LEN_FN)GetProcAddress(h, "av3a_stream_length");
+    g_av3a_read = (AV3A_READ_FN)GetProcAddress(h, "av3a_stream_read");
+    g_av3a_close = (AV3A_CLOSE_FN)GetProcAddress(h, "av3a_stream_close");
+    if (g_av3a_probe == nullptr || g_av3a_open == nullptr || g_av3a_len == nullptr ||
+        g_av3a_read == nullptr || g_av3a_close == nullptr)
+    {
+        FreeLibrary(h);
+        return;
+    }
+    m_av3a_dll = h;
+}
+
+QWORD CALLBACK CBassCore::Av3aFileLen(void* user)
+{
+    Av3aMemFile* f = static_cast<Av3aMemFile*>(user);
+    return f->size;
+}
+
+BOOL CALLBACK CBassCore::Av3aFileSeek(QWORD offset, void* user)
+{
+    Av3aMemFile* f = static_cast<Av3aMemFile*>(user);
+    if (offset > f->size)
+        offset = f->size;
+    f->pos = offset;
+    return TRUE;
+}
+
+DWORD CALLBACK CBassCore::Av3aFileRead(void* buffer, DWORD length, void* user)
+{
+    Av3aMemFile* f = static_cast<Av3aMemFile*>(user);
+    QWORD remain = f->size - f->pos;
+    if (length > remain)
+        length = static_cast<DWORD>(remain);
+    if (length == 0)
+        return 0;
+    int got = g_av3a_read(f->h, buffer, length, f->pos);
+    if (got > 0)
+    {
+        f->pos += got;
+        return static_cast<DWORD>(got);
+    }
+    return 0;
+}
+
+void CALLBACK CBassCore::Av3aFileClose(void* user)
+{
+    (void)user;
+}
+
+void CBassCore::FreeAv3a()
+{
+    m_av3a_active = false;
+    if (m_av3a_ctx.h != nullptr)
+    {
+        g_av3a_close(m_av3a_ctx.h);
+        m_av3a_ctx = Av3aMemFile{};
+    }
+}
+
+bool CBassCore::TryOpenAv3a(const wchar_t* file_path, DWORD flags)
+{
+    InitAv3aDll();
+    if (m_av3a_dll == nullptr)
+        return false;
+
+    wstring path = file_path;
+    size_t dot = path.find_last_of(L'.');
+    if (dot == wstring::npos)
+        return false;
+    wstring ext = path.substr(dot + 1);
+    for (auto& ch : ext)
+        ch = towlower(ch);
+    if (ext != L"m4a" && ext != L"mp4" && ext != L"av3a")
+        return false;
+
+    if (!g_av3a_probe(file_path))
+        return false;
+
+    void* sh = g_av3a_open(file_path);
+    if (sh == nullptr)
+        return false;
+    QWORD size = g_av3a_len(sh);
+    if (size <= 44)
+    {
+        g_av3a_close(sh);
+        return false;
+    }
+
+    m_av3a_ctx.h = sh;
+    m_av3a_ctx.size = size;
+    m_av3a_ctx.pos = 0;
+    m_av3a_procs.close = Av3aFileClose;
+    m_av3a_procs.length = Av3aFileLen;
+    m_av3a_procs.read = Av3aFileRead;
+    m_av3a_procs.seek = Av3aFileSeek;
+
+    m_musicStream = BASS_StreamCreateFileUser(STREAMFILE_NOBUFFER, flags, &m_av3a_procs, &m_av3a_ctx);
+    if (m_musicStream == 0)
+    {
+        FreeAv3a();
+        return false;
+    }
+    m_av3a_active = true;
+    return true;
+}
+// --------------------------------------------------------------------------
+
 #define CONVERTING_TEMP_FILE_NAME L"converting_5k2019u6271iyt8j"
 
 CBassCore::CBassCore()
@@ -308,12 +444,14 @@ void CBassCore::Open(const wchar_t * file_path)
         flags |= BASS_STREAM_DECODE;
     if (CCommon::IsURL(m_file_path))
         m_musicStream = BASS_StreamCreateURL(file_path, 0, flags, NULL, NULL);
-    else
+    else if (!TryOpenAv3a(file_path, flags))
         m_musicStream = BASS_StreamCreateFile(FALSE, /*(GetCurrentFilePath()).c_str()*/file_path, 0, 0, flags);
     BASS_ChannelGetInfo(m_musicStream, &m_channel_info);
     float bitrate{};
     BASS_ChannelGetAttribute(m_musicStream, BASS_ATTRIB_BITRATE, &bitrate);
     m_bitrate = static_cast<int>(bitrate + 0.5f);
+    if (m_av3a_active && m_bitrate <= 0)
+        m_bitrate = 1411;
     m_is_midi = (CAudioCommon::GetAudioTypeByBassChannel(m_channel_info.ctype) == AudioType::AU_MIDI);
     if (m_bass_midi_lib.IsSucceed() && m_is_midi && m_sfont.font != 0)
         m_bass_midi_lib.BASS_MIDI_StreamSetFonts(m_musicStream, &m_sfont, 1);
@@ -354,6 +492,7 @@ void CBassCore::Close()
         BASS_StreamFree(m_musicStream);
         m_musicStream = 0;
     }
+    FreeAv3a();
 }
 
 void CBassCore::Play()

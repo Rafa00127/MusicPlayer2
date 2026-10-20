@@ -94,8 +94,27 @@ private:
     void SetFXHandle();		//设置音效句柄
     void RemoveFXHandle();		//移除音效句柄
 
+    // AVS3-P3 (av3a m4a) support through av3a_dec.dll
+    struct Av3aMemFile
+    {
+        void* h{};
+        QWORD size{};
+        QWORD pos{};
+    };
+    void InitAv3aDll();
+    bool TryOpenAv3a(const wchar_t* file_path, DWORD flags);
+    void FreeAv3a();
+    static QWORD CALLBACK Av3aFileLen(void* user);
+    static BOOL CALLBACK Av3aFileSeek(QWORD offset, void* user);
+    static DWORD CALLBACK Av3aFileRead(void* buffer, DWORD length, void* user);
+    static void CALLBACK Av3aFileClose(void* user);
+
 private:
     HSTREAM m_musicStream{};		//当前的音频句柄
+    void* m_av3a_dll{};
+    Av3aMemFile m_av3a_ctx{};
+    BASS_FILEPROCS m_av3a_procs{};
+    bool m_av3a_active{};
     wstring m_file_path;            //当前音频文件的路径
     vector<HPLUGIN> m_plugin_handles;		//插件的句柄
     wstring m_sfont_name;		//MIDI音色库的名称
